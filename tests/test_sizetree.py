@@ -280,6 +280,8 @@ class SizetreeTests(unittest.TestCase):
         self.assertEqual(help_result.returncode, 0)
         self.assertIn("Up / Down", help_result.stdout)
         self.assertRegex(help_result.stdout, r"Tab +Expand or collapse")
+        self.assertRegex(help_result.stdout, r"o +Open the selected file in")
+        self.assertIn("Ctrl+O: editor", help_result.stdout)
 
     def test_parallel_scan_matches_single_worker_across_many_branches(self):
         tree = self.root / "many-branches"
@@ -952,6 +954,42 @@ class SizetreeTests(unittest.TestCase):
                     terminal.finish()
             finally:
                 release.touch()
+
+    def test_editor_shortcuts_open_exact_filename_and_restore_browser(self):
+        editor = self.cache_home / "fake-editor"
+        log = self.cache_home / "edited.json"
+        editor.write_text("#!" + sys.executable + "\n" +
+            "import json, os, sys, termios\n"
+            "settings = termios.tcgetattr(0)\n"
+            "with open(os.environ['SIZETREE_EDIT_LOG'], 'w') as output:\n"
+            "    json.dump({'args': sys.argv[1:], 'tty': [os.isatty(i) for i in range(3)], "
+            "'canonical': bool(settings[3] & termios.ICANON), "
+            "'echo': bool(settings[3] & termios.ECHO)}, output)\n")
+        editor.chmod(0o755)
+        name = "-draft $(touch OWNED) 'quoted'.txt"
+        target = self.root / "alpha" / "nested" / name
+        target.write_text("document")
+        with mock.patch.dict(os.environ, {
+                "VISUAL": str(editor) + " --terminal", "EDITOR": "/does/not/run",
+                "SIZETREE_EDIT_LOG": str(log)}):
+            with TerminalSession(self.root, arguments=("--no-cache",)) as terminal:
+                terminal.wait_for(lambda s: "Scanned " in s)
+                terminal.send(b"/quoted")
+                terminal.wait_for(lambda s: "1/1 matches" in s and re.search(r"> .*quoted", s))
+                terminal.send(b"\x0f")
+                terminal.wait_for(lambda s: "Closed " in s and "in editor." in s and log.exists())
+                edited = json.loads(log.read_text())
+                self.assertEqual(edited["args"], ["--terminal", str(target)])
+                self.assertEqual(edited["tty"], [True, True, True])
+                self.assertTrue(edited["canonical"])
+                self.assertTrue(edited["echo"])
+                self.assertRegex(terminal.screen(), r"> .*quoted")
+                self.assertFalse((self.root / "OWNED").exists())
+                log.unlink()
+                terminal.send(b"o")
+                terminal.wait_for(lambda s: "Closed " in s and log.exists())
+                self.assertEqual(json.loads(log.read_text())["args"], ["--terminal", str(target)])
+                terminal.finish()
 
     def test_open_failures_are_reported_without_exiting_the_browser(self):
         directory, log = self.fake_opener()

@@ -26,8 +26,6 @@ Static builds require static C and C++ runtime libraries for the selected compil
 
 Run `make clean` to remove both `build/` and `build-static/`. Custom directories set with `BUILD_DIR` and `STATIC_BUILD_DIR` are also honored.
 
-On NFS, cleaning a binary that is still running can leave a busy `.nfs*` file. Close the instance first (`fg`, then `q` if suspended), then rerun `make clean`. Use `lsof -- FILE` or `fuser -v FILE` on the host running the process to find which program holds the file. Cleanup reports failure and a diagnostic while these files remain.
-
 Run from any directory to inspect that directory, or supply a path:
 
 ```sh
@@ -60,6 +58,8 @@ The best worker count depends on storage latency and directory structure. A sing
 | Up / Down (or k / j) | Move selection up / down through files and directories |
 | Tab (or Space) | Expand or collapse the selected directory |
 | Enter | Open the selected file with `xdg-open`, or expand/collapse a directory |
+| o | Open the selected file in `$VISUAL` or `$EDITOR` (default: `vi`) |
+| Ctrl+O (during search) | Open the selected search result in the terminal editor |
 | / | Start fuzzy file search throughout the scanned tree |
 | r | Refresh the selected directory, including all descendants |
 | Right (or l) | Expand the selected directory |
@@ -87,11 +87,11 @@ Total: 14.0 KiB | Scanned 6 entries in 0 min 1 sec
 
 Directories come first at each level, then files; each group is sorted largest first, with names breaking ties. Selection stays on the same entry as sizes update. The screen scrolls with selection and adapts to terminal resizing.
 
-Press `/` and type part of a filename or relative path to jump to a fuzzy match, including files inside collapsed folders. Separate terms with spaces to require **all terms**, in any order, anywhere in the relative path. For example, `ebm loadstore` and `LOADSTORE EBM` both match `EBM/LoadStore.cpp`. Each term is fuzzy: `scb` can match `secret.bin`. Matching always ignores letter case (non-ASCII letters follow the current locale) and favors filenames, adjacent letters, and word boundaries. Extra spaces are ignored. Files and symbolic links are searched; directories and special files are excluded. No `fzf` installation is needed.
+In search mode, **Tab / Down** selects the next match, **Shift-Tab / Up** selects the previous match, **Backspace** deletes a character, and **Ctrl+U** clears the query. The match counter shows your position, and cycling wraps around. **Ctrl+F / Page Down** and **Ctrl+B / Page Up** move down or up one page of matches, stopping at the last or first match. **Enter** opens the selected file with `xdg-open`, **Ctrl+O** opens it in the terminal editor, and both return to browsing. **Escape** leaves search with the selected file visible. Letters such as `q`, `r`, and `o`, and `/`, are ordinary query text while searching; spaces separate terms.
 
-In search mode, **Tab / Down** selects the next match, **Shift-Tab / Up** selects the previous match, **Backspace** deletes a character, and **Ctrl+U** clears the query. The match counter shows your position, and cycling wraps around. **Ctrl+F / Page Down** and **Ctrl+B / Page Up** move down or up one page of matches, stopping at the last or first match. **Enter** opens the selected file and returns to browsing; **Escape** leaves search with the selected file visible. Letters such as `q` and `r`, and `/`, are ordinary query text while searching; spaces separate terms.
+Search uses entries already loaded in memory, works in small batches, and updates as scanning or refreshes discover changes. The selected match's parent folders expand automatically. Opening files with **Enter** requires `xdg-open` (usually provided by `xdg-utils`) and a working desktop session. The opener runs asynchronously, receives the filename as a single argument, and reports launch failures in the status line.
 
-Search uses entries already loaded in memory, works in small batches, and updates as scanning or refreshes discover changes. The selected match's parent folders expand automatically. Opening files requires `xdg-open` (usually provided by `xdg-utils`) and a working desktop session. The opener runs asynchronously, receives the filename as a single argument, and reports launch failures in the status line.
+Press **o** while browsing, or **Ctrl+O** while searching, to open the selected file inside the terminal. SizeTree temporarily restores the terminal, runs `$VISUAL`, `$EDITOR`, or `vi` (in that order), and returns to the same selection when the editor exits. Editor values may include ordinary command-line options. Plain `o` remains available as query text during search.
 
 The status line shows elapsed time while scanning, for example `Scanning... 2841 entries | elapsed 0 min 12 sec`. Once all queued scans finish, it shows `Scanned 2841 entries in 0 min 15 sec` and keeps that duration fixed. A manual or automatic refresh started while idle resets the timer.
 

@@ -1241,6 +1241,9 @@ public:
     Terminal(const Terminal&) = delete;
     Terminal& operator=(const Terminal&) = delete;
 
+    void deactivate() { restore(); }
+    void reactivate() { if (!interrupted) activate(); }
+
     bool handleJobControl() {
         if (!suspendRequested && !resumeRequested) return false;
         if (suspendRequested) {
@@ -1300,9 +1303,117 @@ private:
     }
 };
 
+class TerminalEditor {
+public:
+    std::string message;
+
+    void open(const std::optional<fs::path>& path, Terminal& terminal) {
+        if (!path) { message = "File is no longer available; refresh or search again."; return; }
+
+        auto filename = path->string();
+        terminal.deactivate();
+        int error = 0, status = 0;
+        pid_t child = -1;
+        {
+            EditorSignalScope signals;
+            error = signals.error();
+            posix_spawnattr_t attributes;
+            bool attributesInitialized = false;
+            if (!error) {
+                error = ::posix_spawnattr_init(&attributes);
+                attributesInitialized = !error;
+            }
+            if (!error) {
+                sigset_t defaults, mask;
+                ::sigemptyset(&defaults);
+                ::sigemptyset(&mask);
+                for (const int signal : {SIGINT, SIGQUIT, SIGTERM, SIGHUP, SIGPIPE, SIGTSTP, SIGCONT})
+                    ::sigaddset(&defaults, signal);
+                const auto check = [&](int result) { if (!error) error = result; };
+                check(::posix_spawnattr_setsigdefault(&attributes, &defaults));
+                check(::posix_spawnattr_setsigmask(&attributes, &mask));
+                check(::posix_spawnattr_setflags(&attributes,
+                    POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK));
+            }
+            if (!error) {
+                char shell[] = "/bin/sh";
+                char option[] = "-c";
+                // Expanding the editor unquoted permits conventional values such as
+                // "nvim -f". The filename remains a separate, quoted positional argument.
+                char command[] = "exec ${VISUAL:-${EDITOR:-vi}} \"$@\"";
+                char name[] = "sizetree-editor";
+                char* arguments[] = {shell, option, command, name, filename.data(), nullptr};
+                error = ::posix_spawn(&child, shell, nullptr, &attributes, arguments, environ);
+            }
+            if (attributesInitialized) ::posix_spawnattr_destroy(&attributes);
+            if (!error) {
+                bool forwarded = false;
+                while (true) {
+                    const auto result = ::waitpid(child, &status, 0);
+                    if (result == child) break;
+                    if (result < 0 && errno == EINTR) {
+                        if (interrupted && !forwarded) {
+                            ::kill(child, interrupted);
+                            forwarded = true;
+                        }
+                        continue;
+                    }
+                    if (result < 0) error = errno;
+                    break;
+                }
+            }
+        }
+        terminal.reactivate();
+
+        const auto shown = displayText(path->filename().string());
+        if (error) message = "Cannot start terminal editor: " + displayText(std::strerror(error));
+        else if (WIFEXITED(status) && WEXITSTATUS(status) == 0) message = "Closed " + shown + " in editor.";
+        else if (WIFEXITED(status)) message = "Editor failed (exit " + std::to_string(WEXITSTATUS(status)) + ").";
+        else if (WIFSIGNALED(status)) message = "Editor terminated by signal " + std::to_string(WTERMSIG(status)) + ".";
+        else message = "Editor stopped unexpectedly.";
+    }
+
+private:
+    class EditorSignalScope {
+    public:
+        EditorSignalScope() {
+            struct sigaction ignore{}, defaults{};
+            ignore.sa_handler = SIG_IGN;
+            defaults.sa_handler = SIG_DFL;
+            ::sigemptyset(&ignore.sa_mask);
+            ::sigemptyset(&defaults.sa_mask);
+            for (std::size_t index = 0; index < signals_.size(); ++index) {
+                const auto* replacement = index < 2 ? &ignore : &defaults;
+                if (::sigaction(signals_[index], replacement, &saved_[index]) != 0) {
+                    error_ = errno;
+                    restore();
+                    break;
+                }
+                ++changed_;
+            }
+        }
+
+        ~EditorSignalScope() { restore(); }
+        int error() const { return error_; }
+
+    private:
+        const std::array<int, 4> signals_{SIGINT, SIGQUIT, SIGTSTP, SIGCONT};
+        std::array<struct sigaction, 4> saved_{};
+        std::size_t changed_ = 0;
+        int error_ = 0;
+
+        void restore() {
+            while (changed_) {
+                --changed_;
+                ::sigaction(signals_[changed_], &saved_[changed_], nullptr);
+            }
+        }
+    };
+};
+
 enum class Key { None, Quit, Up, Down,
                  Toggle, Enter, Search, Text, Backspace, Clear, BackTab,
-                 Refresh, Escape, Left, Right, Home, End, PageUp, PageDown };
+                 Refresh, OpenInEditor, Escape, Left, Right, Home, End, PageUp, PageDown };
 
 int readByte(int timeout) {
     pollfd descriptor{STDIN_FILENO, POLLIN, 0};
@@ -1325,6 +1436,7 @@ Key readKey(bool searching, char& text, int timeout = 100) {
     if (byte == -2 || byte == 4) return Key::Quit;
     if (byte == 6) return Key::PageDown; // Ctrl+F
     if (byte == 2) return Key::PageUp;   // Ctrl+B
+    if (byte == 15) return Key::OpenInEditor; // Ctrl+O
     if (byte == '\t') return Key::Toggle;
     if (byte == '\r' || byte == '\n') return Key::Enter;
     if (searching && byte != 27) {
@@ -1338,6 +1450,7 @@ Key readKey(bool searching, char& text, int timeout = 100) {
         case ' ': return Key::Toggle;
         case '/': return Key::Search;
         case 'r': case 'R': return Key::Refresh;
+        case 'o': case 'O': return Key::OpenInEditor;
         case 'k': return Key::Up;
         case 'j': return Key::Down;
         case 'h': return Key::Left;
@@ -1429,8 +1542,8 @@ std::string render(const Snapshot& snapshot, const std::string& path, int width,
              (row.refreshQueued ? " (refresh queued)" : ""),
              index == selected);
     }
-    line(search && search->active ? "Tab/Down: next | Shift-Tab/Up: previous | Enter: open | Esc: exit search"
-                                 : "Up/Down: move | Tab: toggle | /: search | r: refresh | q: quit");
+    line(search && search->active ? "Tab/Down: next | Shift-Tab/Up: previous | Enter: desktop | Ctrl+O: editor | Esc: exit search"
+                                 : "Up/Down: move | Tab: toggle | Enter: desktop | o: editor | /: search | q: quit");
     if (!snapshot.failure.empty()) line("Scan failed: " + snapshot.failure);
     else if (!notice.empty()) line(notice);
     else if (!snapshot.cacheWarning.empty()) line("Cache unavailable: " + snapshot.cacheWarning);
@@ -1442,6 +1555,7 @@ std::string render(const Snapshot& snapshot, const std::string& path, int width,
 int interactive(DirectoryTree& tree, const fs::path& path) {
     Terminal terminal;
     FileOpener opener;
+    TerminalEditor editor;
     FuzzySearch search;
     NodeId revealedMatch = 0;
     std::unordered_set<NodeId> expanded;
@@ -1472,7 +1586,8 @@ int interactive(DirectoryTree& tree, const fs::path& path) {
             }
         }
         const auto [width, height] = Terminal::dimensions();
-        const auto frame = render(snapshot, displayText(path.string()), width, height, selected, scroll, &search, opener.message);
+        const auto notice = !editor.message.empty() ? editor.message : opener.message;
+        const auto frame = render(snapshot, displayText(path.string()), width, height, selected, scroll, &search, notice);
         if (frame != previousFrame) {
             std::cout << frame << std::flush;
             previousFrame = frame;
@@ -1505,8 +1620,18 @@ int interactive(DirectoryTree& tree, const fs::path& path) {
                 case Key::BackTab: case Key::Up: search.cycle(true); break;
                 case Key::PageDown: search.movePage(page); break;
                 case Key::PageUp: search.movePage(page, true); break;
+                case Key::OpenInEditor:
+                    if (const auto* match = search.current()) {
+                        const auto file = tree.filePath(match->parent, match->node);
+                        search.close();
+                        opener.message.clear();
+                        editor.open(file, terminal);
+                        previousFrame.clear();
+                    }
+                    break;
                 case Key::Enter:
                     if (const auto* match = search.current()) {
+                        editor.message.clear();
                         opener.open(tree.filePath(match->parent, match->node));
                         search.close();
                     }
@@ -1521,6 +1646,7 @@ int interactive(DirectoryTree& tree, const fs::path& path) {
             search.setQuery({});
             revealedMatch = 0;
             opener.message.clear();
+            editor.message.clear();
             continue;
         }
         if (rows.empty()) continue;
@@ -1535,8 +1661,16 @@ int interactive(DirectoryTree& tree, const fs::path& path) {
             case Key::Refresh:
                 if (row.kind == Kind::Directory) tree.refresh(row.node);
                 break;
+            case Key::OpenInEditor:
+                if (row.kind == Kind::File || row.kind == Kind::Link) {
+                    opener.message.clear();
+                    editor.open(tree.filePath(row.parent, row.node), terminal);
+                    previousFrame.clear();
+                }
+                break;
             case Key::Enter:
                 if (row.kind == Kind::File || row.kind == Kind::Link) {
+                    editor.message.clear();
                     opener.open(tree.filePath(row.parent, row.node));
                     break;
                 }
@@ -1625,10 +1759,12 @@ void printHelp() {
         "  Up / Down        Move selection up / down (also k / j)\n"
         "  Tab              Expand or collapse the selected directory\n"
         "  Enter            Open the selected file with xdg-open; toggle directories\n"
+        "  o                Open the selected file in $VISUAL or $EDITOR (default: vi)\n"
         "  Space            Also expand or collapse the selected directory\n"
         "  /                Fuzzy search files, including collapsed subdirectories\n"
-        "  Search keys      Tab/Shift-Tab: next/previous; Enter: open; Esc: exit search\n"
-        "                   Backspace: delete a character; Ctrl+U: clear the query\n"
+        "  Search keys      Tab/Shift-Tab: next/previous; Enter: desktop open\n"
+        "                   Ctrl+O: editor; Esc: exit; Ctrl+U: clear the query\n"
+        "                   Backspace: delete a character\n"
         "  r                Refresh the selected directory and its contents\n"
         "  Right / Left     Expand / collapse, or select parent (also l / h)\n"
         "  Escape           Collapse the selected folder and select its parent if visible\n"
